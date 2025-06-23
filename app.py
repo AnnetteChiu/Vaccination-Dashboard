@@ -1,12 +1,12 @@
 import os
 import logging
 from datetime import datetime, timedelta
-from flask import Flask, render_template, request, redirect, url_for, flash, abort, send_from_directory, session, jsonify, make_response
-from forms import ContentForm, EditContentForm, ProductForm, AddToCartForm, UpdateCartForm, CheckoutForm, NewsletterSubscriptionForm
+from flask import Flask, render_template, request, redirect, url_for, flash, abort, send_from_directory, session, jsonify
+from forms import ContentForm, EditContentForm, ProductForm, AddToCartForm, UpdateCartForm, CheckoutForm
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 import uuid
-from models import db, Content, UserInteraction, User, OAuth, File, Product, CartItem, Order, OrderItem, Story, Wishlist, ProductReview, Coupon, CouponUsage, ProductView, ContentView, UserSession, ViewAnalytics, NewsletterSubscription, FashionNewsletter, NewsletterAnalytics
+from models import db, Content, UserInteraction, User, OAuth, File, Product, CartItem, Order, OrderItem, Story, Wishlist, ProductReview, Coupon, CouponUsage
 from database_utils import DatabaseManager, DatabaseHealthChecker
 from sqlalchemy import func
 import re
@@ -20,7 +20,6 @@ from ai_relevance import ContentRelevanceAnalyzer
 from user_type_classifier import UserTypeClassifier
 from translations import get_translation, get_available_languages
 from product_recommendation_engine import get_product_recommendations_for_user, get_similar_products
-from newsletter_service import FashionNewsletterService
 import stripe
 import json
 
@@ -79,13 +78,8 @@ csrf = CSRFProtect(app)
 def disable_csrf_for_uploads():
     pass
 
-# Exempt specific routes from CSRF protection
+# Exempt product creation from CSRF (handles file uploads)
 csrf.exempt(lambda: None)  # This will be applied to specific routes
-
-# Exempt wizard API endpoints from CSRF
-@csrf.exempt
-def exempt_wizard_apis():
-    pass
 
 # Initialize Flask-Login
 from flask_login import LoginManager
@@ -103,9 +97,6 @@ app.register_blueprint(make_replit_blueprint(), url_prefix="/auth")
 # Configure Stripe
 stripe.api_key = os.environ.get('STRIPE_SECRET_KEY')
 
-# Initialize newsletter service
-newsletter_service = FashionNewsletterService()
-
 # Get domain for Stripe success/cancel URLs
 def get_domain():
     if os.environ.get('REPLIT_DEPLOYMENT'):
@@ -118,9 +109,9 @@ def get_domain():
 @app.before_request
 def make_session_permanent():
     session.permanent = True
-    # Set default language to Korean if not already set
+    # Set default language if not already set
     if 'language' not in session:
-        session['language'] = 'ko'
+        session['language'] = 'en'
 
 # Application configuration and setup
 
@@ -297,7 +288,33 @@ def get_content_recommendations(content_id, limit=5):
     recommendations.sort(key=lambda x: x['similarity'], reverse=True)
     return recommendations[:limit]
 
-
+def get_trending_content(limit=5):
+    """Get trending content based on recent creation and tags"""
+    # Get recently created content with the most common tags
+    recent_content = Content.query.filter(
+        Content.status == 'Published'
+    ).order_by(Content.created_at.desc()).limit(20).all()
+    
+    # Count tag frequency
+    all_tags = []
+    for content in recent_content:
+        all_tags.extend(content.get_tags_list())
+    
+    popular_tags = [tag for tag, _ in Counter(all_tags).most_common(5)]
+    
+    # Find content with popular tags
+    trending = []
+    for content in recent_content:
+        content_tags = content.get_tags_list()
+        tag_score = sum(1 for tag in content_tags if tag in popular_tags)
+        if tag_score > 0:
+            trending.append({
+                'content': content,
+                'score': tag_score
+            })
+    
+    trending.sort(key=lambda x: x['score'], reverse=True)
+    return trending[:limit]
 
 def get_category_recommendations(category, exclude_id=None, limit=5):
     """Get popular content from the same category"""
@@ -321,167 +338,6 @@ def get_user_id():
     if 'user_id' not in session:
         session['user_id'] = str(uuid.uuid4())
     return session['user_id']
-
-# ================================
-# User Views Tracking System
-# ================================
-
-def get_session_id():
-    """Get or create session ID for tracking"""
-    if 'session_id' not in session:
-        session['session_id'] = str(uuid.uuid4())
-    return session['session_id']
-
-def get_device_type(user_agent):
-    """Detect device type from user agent"""
-    user_agent = user_agent.lower()
-    if 'mobile' in user_agent or 'android' in user_agent or 'iphone' in user_agent:
-        return 'mobile'
-    elif 'tablet' in user_agent or 'ipad' in user_agent:
-        return 'tablet'
-    else:
-        return 'desktop'
-
-def get_browser_info(user_agent):
-    """Extract browser information from user agent"""
-    user_agent = user_agent.lower()
-    if 'chrome' in user_agent:
-        return 'Chrome'
-    elif 'firefox' in user_agent:
-        return 'Firefox'
-    elif 'safari' in user_agent:
-        return 'Safari'
-    elif 'edge' in user_agent:
-        return 'Edge'
-    else:
-        return 'Other'
-
-def track_product_view(product_id, user_id=None, engagement_data=None):
-    """Track product view with detailed analytics"""
-    try:
-        if not user_id:
-            user_id = current_user.id if current_user.is_authenticated else get_user_id()
-        
-        session_id = get_session_id()
-        ip_address = request.environ.get('HTTP_X_FORWARDED_FOR', request.environ.get('REMOTE_ADDR'))
-        user_agent = request.headers.get('User-Agent', '')
-        referrer = request.headers.get('Referer', '')
-        
-        # Create or update session
-        user_session = UserSession.query.filter_by(session_id=session_id).first()
-        if not user_session:
-            user_session = UserSession()
-            user_session.user_id = user_id
-            user_session.session_id = session_id
-            user_session.ip_address = ip_address
-            user_session.user_agent = user_agent
-            user_session.device_type = get_device_type(user_agent)
-            user_session.browser = get_browser_info(user_agent)
-            db.session.add(user_session)
-        
-        # Update session activity
-        user_session.last_activity = datetime.utcnow()
-        user_session.products_viewed = (user_session.products_viewed or 0) + 1
-        user_session.page_views = (user_session.page_views or 0) + 1
-        
-        # Create product view record
-        product_view = ProductView()
-        product_view.user_id = user_id
-        product_view.product_id = product_id
-        product_view.session_id = session_id
-        product_view.ip_address = ip_address
-        product_view.user_agent = user_agent
-        product_view.referrer = referrer
-        
-        # Add engagement data if provided
-        if engagement_data:
-            product_view.view_duration = engagement_data.get('duration', 0)
-            product_view.scroll_depth = engagement_data.get('scroll_depth', 0.0)
-            product_view.clicked_images = engagement_data.get('clicked_images', False)
-            product_view.viewed_reviews = engagement_data.get('viewed_reviews', False)
-        
-        db.session.add(product_view)
-        db.session.commit()
-        
-        return product_view.id
-    except Exception as e:
-        logging.error(f"Error tracking product view: {e}")
-        db.session.rollback()
-        return None
-
-def track_content_view(content_id, user_id=None, engagement_data=None):
-    """Track content view with detailed analytics"""
-    try:
-        if not user_id:
-            user_id = current_user.id if current_user.is_authenticated else get_user_id()
-        
-        session_id = get_session_id()
-        ip_address = request.environ.get('HTTP_X_FORWARDED_FOR', request.environ.get('REMOTE_ADDR'))
-        user_agent = request.headers.get('User-Agent', '')
-        referrer = request.headers.get('Referer', '')
-        
-        # Create content view record
-        content_view = ContentView()
-        content_view.user_id = user_id
-        content_view.content_id = content_id
-        content_view.session_id = session_id
-        content_view.ip_address = ip_address
-        content_view.user_agent = user_agent
-        content_view.referrer = referrer
-        
-        # Add engagement data if provided
-        if engagement_data:
-            content_view.view_duration = engagement_data.get('duration', 0)
-            content_view.scroll_depth = engagement_data.get('scroll_depth', 0.0)
-            content_view.read_percentage = engagement_data.get('read_percentage', 0.0)
-        
-        db.session.add(content_view)
-        db.session.commit()
-        
-        return content_view.id
-    except Exception as e:
-        logging.error(f"Error tracking content view: {e}")
-        db.session.rollback()
-        return None
-
-def get_product_view_stats(product_id, days=30):
-    """Get view statistics for a product"""
-    try:
-        start_date = datetime.utcnow() - timedelta(days=days)
-        
-        views = ProductView.query.filter(
-            ProductView.product_id == product_id,
-            ProductView.viewed_at >= start_date
-        ).all()
-        
-        if not views:
-            return {
-                'total_views': 0,
-                'unique_viewers': 0,
-                'avg_duration': 0,
-                'engagement_rate': 0
-            }
-        
-        unique_viewers = len(set(view.user_id for view in views))
-        total_duration = sum(view.view_duration for view in views if view.view_duration)
-        avg_duration = total_duration / len(views) if views else 0
-        engaged_views = len([v for v in views if v.scroll_depth > 0.5 or v.clicked_images])
-        engagement_rate = (engaged_views / len(views)) * 100 if views else 0
-        
-        return {
-            'total_views': len(views),
-            'unique_viewers': unique_viewers,
-            'avg_duration': round(avg_duration, 2),
-            'engagement_rate': round(engagement_rate, 2)
-        }
-    except Exception as e:
-        logging.error(f"Error getting product view stats: {e}")
-        return {
-            'total_views': 0,
-            'unique_viewers': 0,
-            'avg_duration': 0,
-            'engagement_rate': 0
-        }
 
 def track_user_interaction(content_id, interaction_type, score=1.0):
     """Track user interaction for collaborative filtering"""
@@ -743,7 +599,8 @@ def index():
     # Convert to dictionary format for template compatibility
     filtered_content = {content.id: content.to_dict() for content in content_list}
     
-
+    # Get trending content for sidebar
+    trending = get_trending_content(limit=5)
     
     # Get statistics for hero banner
     total_products = Product.query.filter(Product.is_active == True).count()
@@ -757,9 +614,6 @@ def index():
         Product.created_at >= week_ago
     ).count()
     
-    # Get all active products for fashion banner
-    products = Product.query.filter_by(is_active=True).order_by(Product.created_at.desc()).all()
-    
     return render_template('index.html', 
                          content_store=filtered_content,
                          categories=CONTENT_CATEGORIES,
@@ -767,11 +621,11 @@ def index():
                          current_category=category_filter,
                          current_status=status_filter,
                          current_search=request.args.get('search', ''),
+                         trending=trending,
                          stories=stories,
                          recommendations=recommendations,
                          user_preferences=user_preferences,
                          featured_products=featured_products,
-                         products=products,
                          total_products=total_products,
                          total_content=total_content,
                          new_arrivals_count=new_arrivals_count)
@@ -1177,7 +1031,7 @@ def inject_translation_functions():
     return dict(
         get_translation=get_translation,
         get_available_languages=get_available_languages,
-        current_language=session.get('language', 'ko')
+        current_language=session.get('language', 'en')
     )
 
 @app.route('/gallery')
@@ -1214,7 +1068,11 @@ def image_gallery():
     db.session.commit()
     return render_template('gallery.html', images=images)
 
-
+@app.route('/trending')
+def trending_content():
+    """Display trending content"""
+    trending = get_trending_content(limit=10)
+    return render_template('trending.html', trending=trending)
 
 @app.route('/analytics/cf')
 def cf_analytics():
@@ -1768,15 +1626,12 @@ def shop():
 
 @app.route('/product/<int:product_id>')
 def product_detail(product_id):
-    """Product detail page with automatic view tracking"""
+    """Product detail page"""
     try:
         product = Product.query.get_or_404(product_id)
         
         if not product.is_active:
             abort(404)
-        
-        # Track product view automatically
-        track_product_view(product_id)
         
         # Add to cart form
         form = AddToCartForm()
@@ -1793,23 +1648,11 @@ def product_detail(product_id):
         except Exception as e:
             app.logger.warning(f"Error getting similar products: {e}")
         
-        # Get view statistics for this product
-        view_stats = get_product_view_stats(product_id)
-        
-        # Get product reviews and average rating
-        reviews = ProductReview.query.filter_by(product_id=product_id).order_by(ProductReview.created_at.desc()).all()
-        avg_rating = 0
-        if reviews:
-            avg_rating = sum(review.rating for review in reviews) / len(reviews)
-        
         return render_template('product_detail.html', 
                              product=product,
                              form=form,
                              cart_count=cart_count,
-                             similar_products=similar_products,
-                             view_stats=view_stats,
-                             reviews=reviews,
-                             avg_rating=round(avg_rating, 1))
+                             similar_products=similar_products)
     except Exception as e:
         app.logger.error(f"Error in product detail: {e}")
         flash('Error loading product', 'error')
@@ -2106,14 +1949,13 @@ def delete_product(product_id):
     return redirect(url_for('my_products'))
 
 @app.route('/add-to-cart', methods=['POST'])
-@csrf.exempt
 @require_login
 def add_to_cart():
     """Add product to cart"""
     try:
-        product_id = request.form.get('product_id', type=int)
         form = AddToCartForm()
-        if form.validate():
+        if form.validate_on_submit():
+            product_id = request.form.get('product_id', type=int)
             quantity = form.quantity.data
             
             product = Product.query.get_or_404(product_id)
@@ -2647,7 +2489,6 @@ def order_detail(order_id):
         return redirect(url_for('my_orders'))
 
 @app.route('/create_story', methods=['GET', 'POST'])
-@csrf.exempt
 @require_login
 def create_story():
     """Create a new limited-time story"""
@@ -2657,332 +2498,37 @@ def create_story():
     
     form = StoryForm()
     
-    # Populate product choices for current user's products
+    # Populate product choices
     products = Product.query.filter_by(seller_id=current_user.id).all()
     form.product_id.choices = [('', 'No product')] + [(str(p.id), p.name) for p in products]
     
-    if request.method == 'POST':
-        app.logger.info(f"Story form submission - Valid: {form.validate()}")
-        app.logger.info(f"Form errors: {form.errors}")
+    if form.validate_on_submit():
+        # Handle image upload
+        image_url = None
+        if form.image.data:
+            image_url = save_image_file(form.image.data)
         
-        if form.validate():
-            try:
-                # Handle image upload
-                image_url = None
-                if form.image.data:
-                    image_url = save_image_file(form.image.data)
-                
-                # Create new story using the updated model fields
-                story = Story()
-                story.title = form.title.data
-                story.content = form.content.data
-                story.story_type = form.story_type.data
-                story.expires_at = form.expires_at.data
-                story.priority = form.priority.data
-                story.image_url = image_url
-                story.user_id = current_user.id  # Updated field name
-                story.author_name = current_user.first_name or current_user.email or "Unknown"
-                
-                # Link to product if specified
-                if form.product_id.data:
-                    story.linked_product_id = int(form.product_id.data)  # Updated field name
-                
-                db.session.add(story)
-                db.session.commit()
-                
-                flash('Story created successfully! 스토리가 성공적으로 생성되었습니다!', 'success')
-                return redirect(url_for('stories'))
-            except Exception as e:
-                app.logger.error(f"Error creating story: {e}")
-                db.session.rollback()
-                flash('Error creating story. Please try again. 스토리 생성 중 오류가 발생했습니다.', 'error')
-        else:
-            flash('Please check the form for errors. 양식 오류를 확인해주세요.', 'error')
-    
-    return render_template('create_story.html', form=form)
-
-@app.route('/stories')
-def stories():
-    """View all active stories sorted by recommendation algorithm"""
-    # Get active stories
-    active_stories = Story.get_active_stories(limit=50)
-    
-    # Apply recommendation algorithm to sort stories
-    if current_user.is_authenticated:
-        sorted_stories = get_personalized_story_recommendations(current_user.id, active_stories)
-    else:
-        # For anonymous users, use popularity-based sorting
-        sorted_stories = get_trending_story_recommendations(active_stories)
-    
-    # Limit to top 20 for display
-    final_stories = sorted_stories[:20]
-    
-    return render_template('stories.html', stories=final_stories)
-
-def get_personalized_story_recommendations(user_id, stories):
-    """
-    Get personalized story recommendations based on user behavior and preferences
-    """
-    if not stories:
-        return []
-    
-    try:
-        # Get user's interaction history
-        user_interactions = UserInteraction.query.filter_by(user_id=user_id).all()
-        user_views = ProductView.query.filter_by(user_id=user_id).all()
-        user_purchases = Order.query.filter_by(user_id=user_id).all()
+        # Create new story
+        story = Story()
+        story.title = form.title.data
+        story.content = form.content.data
+        story.story_type = form.story_type.data
+        story.expires_at = form.expires_at.data
+        story.priority = form.priority.data
+        story.image_url = image_url
+        story.author_id = current_user.id
         
-        # Calculate story scores based on multiple factors
-        story_scores = []
+        # Link to product if specified
+        if form.product_id.data:
+            story.product_id = int(form.product_id.data)
         
-        for story in stories:
-            score = 0.0
-            
-            # Base popularity score (view count, like count, click count)
-            popularity_score = (
-                (story.view_count or 0) * 0.3 +
-                (story.like_count or 0) * 0.5 +
-                (story.click_count or 0) * 0.2
-            )
-            score += popularity_score * 0.2
-            
-            # Time factor - newer stories get slight boost
-            time_factor = 1.0
-            if story.created_at:
-                hours_old = (datetime.now() - story.created_at).total_seconds() / 3600
-                # Stories less than 24 hours old get boost
-                if hours_old < 24:
-                    time_factor = 1.2 - (hours_old / 24 * 0.2)
-            score += time_factor * 0.1
-            
-            # User interaction similarity
-            if story.linked_product_id:
-                # Check if user has interacted with similar products
-                linked_product = Product.query.get(story.linked_product_id)
-                if linked_product:
-                    # Category matching
-                    for interaction in user_interactions:
-                        if hasattr(interaction, 'content_id'):
-                            content = Content.query.get(interaction.content_id)
-                            if content and content.category == linked_product.category:
-                                score += 0.3
-                    
-                    # Product view matching
-                    for view in user_views:
-                        viewed_product = Product.query.get(view.product_id)
-                        if viewed_product and viewed_product.category == linked_product.category:
-                            score += 0.2
-                    
-                    # Purchase history matching
-                    for purchase in user_purchases:
-                        order_items = OrderItem.query.filter_by(order_id=purchase.id).all()
-                        for item in order_items:
-                            purchased_product = Product.query.get(item.product_id)
-                            if purchased_product and purchased_product.category == linked_product.category:
-                                score += 0.4
-            
-            # Story type preference (learn from user's past story interactions)
-            story_type_boost = 0.0
-            if story.story_type:
-                # Check user's past story interactions by type
-                # This would need story interaction tracking, for now use base boost
-                type_multipliers = {
-                    'product': 1.2,  # Product stories often more engaging
-                    'promotion': 1.1,
-                    'event': 1.0,
-                    'news': 0.9,
-                    'general': 0.8
-                }
-                story_type_boost = type_multipliers.get(story.story_type, 1.0)
-            score *= story_type_boost
-            
-            # Urgency factor (stories expiring soon get priority)
-            if not story.is_expired():
-                time_remaining = story.expires_at - datetime.now()
-                if time_remaining.total_seconds() < 3600:  # Less than 1 hour
-                    score *= 1.3
-                elif time_remaining.total_seconds() < 21600:  # Less than 6 hours
-                    score *= 1.1
-            
-            story_scores.append((story, score))
-        
-        # Sort by score descending
-        story_scores.sort(key=lambda x: x[1], reverse=True)
-        
-        return [story for story, score in story_scores]
-        
-    except Exception as e:
-        print(f"Error in personalized story recommendations: {e}")
-        # Fallback to popularity-based sorting
-        return get_trending_story_recommendations(stories)
-
-def get_trending_story_recommendations(stories):
-    """
-    Get trending story recommendations for anonymous users
-    """
-    if not stories:
-        return []
-    
-    try:
-        story_scores = []
-        
-        for story in stories:
-            # Calculate trending score based on engagement metrics
-            score = 0.0
-            
-            # Base engagement score
-            view_count = story.view_count or 0
-            like_count = story.like_count or 0
-            click_count = story.click_count or 0
-            
-            # Weighted engagement score
-            engagement_score = (
-                view_count * 0.2 +
-                like_count * 0.4 +
-                click_count * 0.4
-            )
-            
-            # Time decay factor - recent stories get more weight
-            if story.created_at:
-                hours_old = (datetime.now() - story.created_at).total_seconds() / 3600
-                time_factor = max(0.1, 1.0 - (hours_old / 168))  # Decay over 1 week
-                score = engagement_score * time_factor
-            else:
-                score = engagement_score * 0.5
-            
-            # Story type popularity boost
-            type_boosts = {
-                'product': 1.3,      # Product stories tend to be popular
-                'promotion': 1.2,
-                'event': 1.1,
-                'news': 1.0,
-                'general': 0.9
-            }
-            score *= type_boosts.get(story.story_type, 1.0)
-            
-            # Urgency boost for expiring stories
-            if not story.is_expired():
-                time_remaining = story.expires_at - datetime.now()
-                if time_remaining.total_seconds() < 7200:  # Less than 2 hours
-                    score *= 1.4
-                elif time_remaining.total_seconds() < 21600:  # Less than 6 hours
-                    score *= 1.2
-            
-            # Priority boost
-            if hasattr(story, 'priority') and story.priority:
-                score *= (1.0 + story.priority * 0.1)
-            
-            story_scores.append((story, score))
-        
-        # Sort by score descending
-        story_scores.sort(key=lambda x: x[1], reverse=True)
-        
-        return [story for story, score in story_scores]
-        
-    except Exception as e:
-        print(f"Error in trending story recommendations: {e}")
-        # Fallback to simple time-based sorting
-        return sorted(stories, key=lambda s: s.created_at, reverse=True)
-
-@app.route('/story/<int:story_id>')
-def story_detail(story_id):
-    """View individual story details"""
-    story = Story.query.get_or_404(story_id)
-    
-    # Check if story is expired
-    if story.is_expired():
-        flash('This story has expired. 이 스토리는 만료되었습니다.', 'warning')
-        return redirect(url_for('stories'))
-    
-    # Increment view count
-    story.increment_views()
-    
-    return render_template('story_detail.html', story=story)
-
-@app.route('/story/<int:story_id>/click')
-def story_click(story_id):
-    """Track story click and redirect to linked content"""
-    story = Story.query.get_or_404(story_id)
-    
-    # Increment click count
-    story.increment_clicks()
-    
-    # Redirect to linked product if available
-    if story.linked_product_id:
-        return redirect(url_for('product_detail', product_id=story.linked_product_id))
-    
-    # Otherwise redirect to story detail
-    return redirect(url_for('story_detail', story_id=story_id))
-
-@app.route('/my_stories')
-@require_login
-def my_stories():
-    """View user's own stories"""
-    user_stories = Story.query.filter_by(user_id=current_user.id)\
-        .order_by(Story.created_at.desc()).all()
-    return render_template('my_stories.html', stories=user_stories)
-
-@app.route('/story/<int:story_id>/delete', methods=['POST'])
-@require_login
-def delete_story(story_id):
-    """Delete a story (only owner can delete)"""
-    story = Story.query.get_or_404(story_id)
-    
-    if story.user_id != current_user.id:
-        flash('You can only delete your own stories. 본인의 스토리만 삭제할 수 있습니다.', 'error')
-        return redirect(url_for('my_stories'))
-    
-    db.session.delete(story)
-    db.session.commit()
-    
-    flash('Story deleted successfully! 스토리가 성공적으로 삭제되었습니다!', 'success')
-    return redirect(url_for('my_stories'))
-
-@app.route('/api/story/<int:story_id>/like', methods=['POST'])
-@csrf.exempt
-def like_story(story_id):
-    """Like a story (API endpoint for TikTok-style viewer)"""
-    try:
-        story = Story.query.get_or_404(story_id)
-        
-        # Increment likes
-        if story.likes is None:
-            story.likes = 0
-        story.likes += 1
-        
+        db.session.add(story)
         db.session.commit()
         
-        return jsonify({
-            'success': True,
-            'likes': story.likes,
-            'message': 'Story liked!'
-        })
+        flash('Story created successfully!', 'success')
+        return redirect(url_for('index'))
     
-    except Exception as e:
-        print(f"Error liking story: {e}")
-        return jsonify({
-            'success': False,
-            'message': 'Failed to like story'
-        }), 500
-
-@app.route('/api/stories/cleanup', methods=['POST'])
-def cleanup_expired_stories():
-    """Clean up expired stories (can be called by cron job)"""
-    expired_stories = Story.query.filter(
-        Story.expires_at <= datetime.utcnow()
-    ).all()
-    
-    count = len(expired_stories)
-    for story in expired_stories:
-        story.is_active = False
-    
-    db.session.commit()
-    
-    return jsonify({
-        'success': True,
-        'message': f'Cleaned up {count} expired stories',
-        'count': count
-    })
+    return render_template('create_story.html', form=form)
 
 @app.route('/set_language/<language>')
 def set_language(language):
@@ -3630,475 +3176,10 @@ def api_new_arrivals_stats():
         return jsonify({'success': False, 'error': str(e)})
 
 
-
-@app.route('/sales-reports')
-@require_login
-def sales_reports():
-    """Comprehensive sales reports dashboard"""
-    from datetime import datetime, timedelta
-    from sqlalchemy import func, text
-    
-    # Default date range (last 7 days)
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=7)
-    
-    try:
-        # Calculate key metrics
-        metrics = calculate_sales_metrics(start_date, end_date)
-        
-        # Get top products data
-        top_products = get_top_products_data(start_date, end_date)
-        
-        # Get daily sales data
-        daily_sales = get_daily_sales_data(start_date, end_date)
-        
-        # Get revenue trend data for chart
-        revenue_labels, revenue_data = get_revenue_trend_data(start_date, end_date)
-        
-        # Get category performance data
-        category_labels, category_data = get_category_performance_data(start_date, end_date)
-        
-        # Customer insights
-        customer_insights = get_customer_insights(start_date, end_date)
-        
-        return render_template('sales_reports.html',
-                             start_date=start_date.strftime('%Y-%m-%d'),
-                             end_date=end_date.strftime('%Y-%m-%d'),
-                             total_revenue=metrics['total_revenue'],
-                             revenue_growth=metrics['revenue_growth'],
-                             total_orders=metrics['total_orders'],
-                             orders_growth=metrics['orders_growth'],
-                             avg_order_value=metrics['avg_order_value'],
-                             aov_growth=metrics['aov_growth'],
-                             unique_customers=metrics['unique_customers'],
-                             customers_growth=metrics['customers_growth'],
-                             top_products=top_products,
-                             daily_sales=daily_sales,
-                             revenue_labels=revenue_labels,
-                             revenue_data=revenue_data,
-                             category_labels=category_labels,
-                             category_data=category_data,
-                             new_customers=customer_insights['new_customers'],
-                             returning_customers=customer_insights['returning_customers'],
-                             customer_retention_rate=customer_insights['retention_rate'],
-                             avg_orders_per_customer=customer_insights['avg_orders_per_customer'])
-                             
-    except Exception as e:
-        app.logger.error(f"Error loading sales reports: {e}")
-        flash(f'Error loading sales reports: {str(e)}', 'error')
-        return render_template('sales_reports.html',
-                             start_date=start_date.strftime('%Y-%m-%d'),
-                             end_date=end_date.strftime('%Y-%m-%d'),
-                             total_revenue=0, revenue_growth=0,
-                             total_orders=0, orders_growth=0,
-                             avg_order_value=0, aov_growth=0,
-                             unique_customers=0, customers_growth=0,
-                             top_products=[], daily_sales=[],
-                             revenue_labels=[], revenue_data=[],
-                             category_labels=[], category_data=[],
-                             new_customers=0, returning_customers=0,
-                             customer_retention_rate=0, avg_orders_per_customer=0)
-
-@app.route('/api/sales-reports', methods=['POST'])
-@require_login
-def api_sales_reports():
-    """API endpoint for updating sales reports with custom date range"""
-    try:
-        data = request.get_json()
-        start_date = datetime.strptime(data['start_date'], '%Y-%m-%d')
-        end_date = datetime.strptime(data['end_date'], '%Y-%m-%d')
-        
-        # Calculate metrics for the new date range
-        metrics = calculate_sales_metrics(start_date, end_date)
-        
-        # Get chart data
-        revenue_labels, revenue_data = get_revenue_trend_data(start_date, end_date)
-        category_labels, category_data = get_category_performance_data(start_date, end_date)
-        
-        return jsonify({
-            'success': True,
-            'total_revenue': metrics['total_revenue'],
-            'revenue_growth': metrics['revenue_growth'],
-            'total_orders': metrics['total_orders'],
-            'orders_growth': metrics['orders_growth'],
-            'avg_order_value': metrics['avg_order_value'],
-            'aov_growth': metrics['aov_growth'],
-            'unique_customers': metrics['unique_customers'],
-            'customers_growth': metrics['customers_growth'],
-            'revenue_labels': revenue_labels,
-            'revenue_data': revenue_data,
-            'category_labels': category_labels,
-            'category_data': category_data
-        })
-        
-    except Exception as e:
-        app.logger.error(f"Error updating sales reports: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/export-sales-report')
-@require_login
-def export_sales_report():
-    """Export sales report in CSV or PDF format"""
-    try:
-        format_type = request.args.get('format', 'csv')
-        start_date = datetime.strptime(request.args.get('start_date'), '%Y-%m-%d')
-        end_date = datetime.strptime(request.args.get('end_date'), '%Y-%m-%d')
-        
-        if format_type == 'csv':
-            return export_sales_csv(start_date, end_date)
-        elif format_type == 'pdf':
-            return export_sales_pdf(start_date, end_date)
-        else:
-            return jsonify({'error': 'Invalid format'}), 400
-            
-    except Exception as e:
-        app.logger.error(f"Error exporting sales report: {e}")
-        return jsonify({'error': str(e)}), 500
-
-def calculate_sales_metrics(start_date, end_date):
-    """Calculate key sales metrics for the given date range"""
-    try:
-        # Current period metrics
-        current_orders = Order.query.filter(
-            Order.created_at >= start_date,
-            Order.created_at <= end_date,
-            Order.status == 'delivered'
-        ).all()
-        
-        current_revenue = sum(order.total_amount for order in current_orders)
-        current_order_count = len(current_orders)
-        current_avg_order_value = current_revenue / current_order_count if current_order_count > 0 else 0
-        
-        # Get unique customers
-        unique_customers = len(set(order.user_id for order in current_orders))
-        
-        # Previous period for comparison
-        period_diff = end_date - start_date
-        prev_start = start_date - period_diff
-        prev_end = start_date
-        
-        prev_orders = Order.query.filter(
-            Order.created_at >= prev_start,
-            Order.created_at <= prev_end,
-            Order.status == 'delivered'
-        ).all()
-        
-        prev_revenue = sum(order.total_amount for order in prev_orders)
-        prev_order_count = len(prev_orders)
-        prev_avg_order_value = prev_revenue / prev_order_count if prev_order_count > 0 else 0
-        prev_unique_customers = len(set(order.user_id for order in prev_orders))
-        
-        # Calculate growth percentages
-        revenue_growth = calculate_growth_percentage(current_revenue, prev_revenue)
-        orders_growth = calculate_growth_percentage(current_order_count, prev_order_count)
-        aov_growth = calculate_growth_percentage(current_avg_order_value, prev_avg_order_value)
-        customers_growth = calculate_growth_percentage(unique_customers, prev_unique_customers)
-        
-        return {
-            'total_revenue': int(current_revenue),
-            'revenue_growth': revenue_growth,
-            'total_orders': current_order_count,
-            'orders_growth': orders_growth,
-            'avg_order_value': int(current_avg_order_value),
-            'aov_growth': aov_growth,
-            'unique_customers': unique_customers,
-            'customers_growth': customers_growth
-        }
-        
-    except Exception as e:
-        app.logger.error(f"Error calculating sales metrics: {e}")
-        return {
-            'total_revenue': 0, 'revenue_growth': 0,
-            'total_orders': 0, 'orders_growth': 0,
-            'avg_order_value': 0, 'aov_growth': 0,
-            'unique_customers': 0, 'customers_growth': 0
-        }
-
-def calculate_growth_percentage(current, previous):
-    """Calculate growth percentage between two values"""
-    if previous == 0:
-        return 100 if current > 0 else 0
-    return round(((current - previous) / previous) * 100, 1)
-
-def get_top_products_data(start_date, end_date, limit=10):
-    """Get top performing products by revenue"""
-    try:
-        # Query to get top products with sales data
-        top_products_query = db.session.query(
-            Product,
-            func.sum(OrderItem.quantity).label('quantity_sold'),
-            func.sum(OrderItem.quantity * Product.price).label('total_revenue'),
-            func.avg(ProductReview.rating).label('avg_rating')
-        ).join(
-            OrderItem, Product.id == OrderItem.product_id
-        ).join(
-            Order, OrderItem.order_id == Order.id
-        ).outerjoin(
-            ProductReview, Product.id == ProductReview.product_id
-        ).filter(
-            Order.created_at >= start_date,
-            Order.created_at <= end_date,
-            Order.status == 'delivered'
-        ).group_by(
-            Product.id
-        ).order_by(
-            func.sum(OrderItem.quantity * Product.price).desc()
-        ).limit(limit)
-        
-        results = top_products_query.all()
-        
-        top_products = []
-        for product, quantity_sold, total_revenue, avg_rating in results:
-            top_products.append({
-                'id': product.id,
-                'name': product.name,
-                'category': product.category,
-                'price': product.price,
-                'image_url': product.image_url,
-                'quantity_sold': quantity_sold or 0,
-                'total_revenue': total_revenue or 0,
-                'avg_rating': avg_rating or 0
-            })
-        
-        return top_products
-        
-    except Exception as e:
-        app.logger.error(f"Error getting top products data: {e}")
-        return []
-
-def get_daily_sales_data(start_date, end_date):
-    """Get daily sales breakdown for the date range"""
-    try:
-        daily_sales = db.session.query(
-            func.date(Order.created_at).label('date'),
-            func.count(Order.id).label('orders'),
-            func.sum(Order.total_amount).label('revenue')
-        ).filter(
-            Order.created_at >= start_date,
-            Order.created_at <= end_date,
-            Order.status == 'delivered'
-        ).group_by(
-            func.date(Order.created_at)
-        ).order_by(
-            func.date(Order.created_at).desc()
-        ).all()
-        
-        return [{
-            'date': result.date,
-            'orders': result.orders,
-            'revenue': result.revenue or 0
-        } for result in daily_sales]
-        
-    except Exception as e:
-        app.logger.error(f"Error getting daily sales data: {e}")
-        return []
-
-def get_revenue_trend_data(start_date, end_date):
-    """Get revenue trend data for chart"""
-    try:
-        daily_revenue = db.session.query(
-            func.date(Order.created_at).label('date'),
-            func.sum(Order.total_amount).label('revenue')
-        ).filter(
-            Order.created_at >= start_date,
-            Order.created_at <= end_date,
-            Order.status == 'delivered'
-        ).group_by(
-            func.date(Order.created_at)
-        ).order_by(
-            func.date(Order.created_at)
-        ).all()
-        
-        labels = []
-        data = []
-        
-        for result in daily_revenue:
-            labels.append(result.date.strftime('%m/%d'))
-            data.append(float(result.revenue or 0))
-        
-        return labels, data
-        
-    except Exception as e:
-        app.logger.error(f"Error getting revenue trend data: {e}")
-        return [], []
-
-def get_category_performance_data(start_date, end_date):
-    """Get category performance data for pie chart"""
-    try:
-        category_revenue = db.session.query(
-            Product.category,
-            func.sum(OrderItem.quantity * Product.price).label('revenue')
-        ).join(
-            OrderItem, Product.id == OrderItem.product_id
-        ).join(
-            Order, OrderItem.order_id == Order.id
-        ).filter(
-            Order.created_at >= start_date,
-            Order.created_at <= end_date,
-            Order.status == 'delivered'
-        ).group_by(
-            Product.category
-        ).order_by(
-            func.sum(OrderItem.quantity * Product.price).desc()
-        ).limit(7).all()
-        
-        labels = []
-        data = []
-        
-        for category, revenue in category_revenue:
-            labels.append(category)
-            data.append(float(revenue or 0))
-        
-        return labels, data
-        
-    except Exception as e:
-        app.logger.error(f"Error getting category performance data: {e}")
-        return [], []
-
-def get_customer_insights(start_date, end_date):
-    """Get customer insights and retention metrics"""
-    try:
-        # New customers (first order in this period)
-        new_customers = db.session.query(
-            func.count(func.distinct(Order.user_id))
-        ).filter(
-            Order.created_at >= start_date,
-            Order.created_at <= end_date,
-            Order.status == 'delivered',
-            ~Order.user_id.in_(
-                db.session.query(Order.user_id).filter(
-                    Order.created_at < start_date,
-                    Order.status == 'delivered'
-                )
-            )
-        ).scalar() or 0
-        
-        # Returning customers
-        total_customers = db.session.query(
-            func.count(func.distinct(Order.user_id))
-        ).filter(
-            Order.created_at >= start_date,
-            Order.created_at <= end_date,
-            Order.status == 'delivered'
-        ).scalar() or 0
-        
-        returning_customers = total_customers - new_customers
-        
-        # Retention rate (customers who made multiple orders)
-        repeat_customers = db.session.query(
-            func.count(func.distinct(Order.user_id))
-        ).filter(
-            Order.created_at >= start_date,
-            Order.created_at <= end_date,
-            Order.status == 'delivered'
-        ).having(
-            func.count(Order.id) > 1
-        ).group_by(
-            Order.user_id
-        ).count()
-        
-        retention_rate = round((repeat_customers / total_customers * 100), 1) if total_customers > 0 else 0
-        
-        # Average orders per customer
-        total_orders = db.session.query(
-            func.count(Order.id)
-        ).filter(
-            Order.created_at >= start_date,
-            Order.created_at <= end_date,
-            Order.status == 'delivered'
-        ).scalar() or 0
-        
-        avg_orders_per_customer = round(total_orders / total_customers, 1) if total_customers > 0 else 0
-        
-        return {
-            'new_customers': new_customers,
-            'returning_customers': returning_customers,
-            'retention_rate': retention_rate,
-            'avg_orders_per_customer': avg_orders_per_customer
-        }
-        
-    except Exception as e:
-        app.logger.error(f"Error getting customer insights: {e}")
-        return {
-            'new_customers': 0,
-            'returning_customers': 0,
-            'retention_rate': 0,
-            'avg_orders_per_customer': 0
-        }
-
-def export_sales_csv(start_date, end_date):
-    """Export sales report as CSV"""
-    import csv
-    from io import StringIO
-    
-    try:
-        output = StringIO()
-        writer = csv.writer(output)
-        
-        # Write headers
-        writer.writerow(['Date', 'Orders', 'Revenue', 'Average Order Value'])
-        
-        # Get daily sales data
-        daily_sales = get_daily_sales_data(start_date, end_date)
-        
-        for day in daily_sales:
-            avg_order_value = day['revenue'] / day['orders'] if day['orders'] > 0 else 0
-            writer.writerow([
-                day['date'].strftime('%Y-%m-%d'),
-                day['orders'],
-                day['revenue'],
-                round(avg_order_value, 2)
-            ])
-        
-        output.seek(0)
-        
-        response = make_response(output.getvalue())
-        response.headers['Content-Type'] = 'text/csv'
-        response.headers['Content-Disposition'] = f'attachment; filename=sales_report_{start_date.strftime("%Y%m%d")}_{end_date.strftime("%Y%m%d")}.csv'
-        
-        return response
-        
-    except Exception as e:
-        app.logger.error(f"Error exporting CSV: {e}")
-        return jsonify({'error': str(e)}), 500
-
-def export_sales_pdf(start_date, end_date):
-    """Export sales report as PDF (simplified version)"""
-    try:
-        # For now, return a simple text-based PDF export
-        # In production, you might want to use libraries like ReportLab
-        
-        metrics = calculate_sales_metrics(start_date, end_date)
-        top_products = get_top_products_data(start_date, end_date, 5)
-        
-        report_content = f"""
-SALES REPORT
-Period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}
-
-KEY METRICS:
-- Total Revenue: ₩{metrics['total_revenue']:,}
-- Total Orders: {metrics['total_orders']}
-- Average Order Value: ₩{metrics['avg_order_value']:,}
-- Unique Customers: {metrics['unique_customers']}
-
-TOP PRODUCTS:
-"""
-        
-        for i, product in enumerate(top_products, 1):
-            report_content += f"{i}. {product['name']} - ₩{product['total_revenue']:,} ({product['quantity_sold']} sold)\n"
-        
-        response = make_response(report_content)
-        response.headers['Content-Type'] = 'text/plain'
-        response.headers['Content-Disposition'] = f'attachment; filename=sales_report_{start_date.strftime("%Y%m%d")}_{end_date.strftime("%Y%m%d")}.txt'
-        
-        return response
-        
-    except Exception as e:
-        app.logger.error(f"Error exporting PDF: {e}")
-        return jsonify({'error': str(e)}), 500
+@app.route('/skeleton-demo')
+def skeleton_demo():
+    """Skeleton loading demonstration page"""
+    return render_template('skeleton_demo.html')
 
 @app.errorhandler(403)
 def forbidden_error(error):
@@ -4111,528 +3192,6 @@ def not_found_error(error):
     return render_template('base.html', 
                          error_message="Content not found",
                          error_description="The content you're looking for doesn't exist."), 404
-
-@app.route('/user-views-analytics')
-@require_login
-def user_views_analytics():
-    """Comprehensive user views analytics dashboard"""
-    try:
-        # Get date range from query parameters
-        days = request.args.get('days', 30, type=int)
-        end_date = datetime.utcnow()
-        start_date = end_date - timedelta(days=days)
-        
-        # Get product view analytics
-        product_views = ProductView.query.filter(
-            ProductView.viewed_at >= start_date
-        ).all()
-        
-        # Get content view analytics  
-        content_views = ContentView.query.filter(
-            ContentView.viewed_at >= start_date
-        ).all()
-        
-        # Get session analytics
-        user_sessions = UserSession.query.filter(
-            UserSession.started_at >= start_date
-        ).all()
-        
-        # Calculate product metrics
-        product_metrics = []
-        products = Product.query.filter_by(is_active=True).all()
-        
-        for product in products:
-            p_views = [v for v in product_views if v.product_id == product.id]
-            if p_views:
-                unique_viewers = len(set(v.user_id for v in p_views))
-                avg_duration = sum(v.view_duration for v in p_views if v.view_duration) / len(p_views)
-                engagement_rate = len([v for v in p_views if v.scroll_depth > 0.5 or v.clicked_images]) / len(p_views) * 100
-                
-                product_metrics.append({
-                    'id': product.id,
-                    'name': product.name,
-                    'category': product.category,
-                    'total_views': len(p_views),
-                    'unique_viewers': unique_viewers,
-                    'avg_duration': round(avg_duration, 2),
-                    'engagement_rate': round(engagement_rate, 2),
-                    'seller': product.seller.first_name if product.seller else 'Unknown'
-                })
-        
-        # Sort by total views
-        product_metrics.sort(key=lambda x: x['total_views'], reverse=True)
-        
-        # Calculate daily analytics
-        daily_analytics = []
-        for i in range(days):
-            date = start_date + timedelta(days=i)
-            day_product_views = [v for v in product_views if v.viewed_at.date() == date.date()]
-            day_content_views = [v for v in content_views if v.viewed_at.date() == date.date()]
-            day_sessions = [s for s in user_sessions if s.started_at.date() == date.date()]
-            
-            daily_analytics.append({
-                'date': date.strftime('%Y-%m-%d'),
-                'product_views': len(day_product_views),
-                'content_views': len(day_content_views),
-                'unique_users': len(set([v.user_id for v in day_product_views + day_content_views])),
-                'sessions': len(day_sessions),
-                'avg_session_duration': round(sum(s.duration_minutes for s in day_sessions) / len(day_sessions), 2) if day_sessions else 0
-            })
-        
-        # Device analytics
-        device_breakdown = {'desktop': 0, 'mobile': 0, 'tablet': 0}
-        for session in user_sessions:
-            if session.device_type in device_breakdown:
-                device_breakdown[session.device_type] += 1
-        
-        # Browser analytics
-        browser_breakdown = {}
-        for session in user_sessions:
-            browser = session.browser or 'Unknown'
-            browser_breakdown[browser] = browser_breakdown.get(browser, 0) + 1
-        
-        # Top referrers
-        referrer_breakdown = {}
-        for view in product_views + content_views:
-            if view.referrer:
-                domain = view.referrer.split('/')[2] if '/' in view.referrer else view.referrer
-                referrer_breakdown[domain] = referrer_breakdown.get(domain, 0) + 1
-        
-        # Overall statistics
-        total_product_views = len(product_views)
-        total_content_views = len(content_views)
-        total_unique_users = len(set([v.user_id for v in product_views + content_views]))
-        total_sessions = len(user_sessions)
-        avg_session_duration = sum(s.duration_minutes for s in user_sessions) / len(user_sessions) if user_sessions else 0
-        
-        return render_template('user_views_analytics.html',
-                             product_metrics=product_metrics[:15],
-                             daily_analytics=daily_analytics,
-                             device_breakdown=device_breakdown,
-                             browser_breakdown=dict(sorted(browser_breakdown.items(), key=lambda x: x[1], reverse=True)[:10]),
-                             referrer_breakdown=dict(sorted(referrer_breakdown.items(), key=lambda x: x[1], reverse=True)[:10]),
-                             total_product_views=total_product_views,
-                             total_content_views=total_content_views,
-                             total_unique_users=total_unique_users,
-                             total_sessions=total_sessions,
-                             avg_session_duration=round(avg_session_duration, 2),
-                             days=days)
-    except Exception as e:
-        app.logger.error(f"Error in user views analytics: {e}")
-        flash('Error loading user views analytics', 'error')
-        return redirect(url_for('index'))
-
-# API Endpoints for User Engagement Tracking
-
-@app.route('/api/track-engagement', methods=['POST'])
-def track_engagement():
-    """API endpoint to track user engagement metrics"""
-    try:
-        data = request.get_json()
-        
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
-        
-        engagement_type = data.get('type')  # 'product' or 'content'
-        item_id = data.get('item_id')
-        engagement_data = {
-            'duration': data.get('duration', 0),
-            'scroll_depth': data.get('scroll_depth', 0.0),
-            'clicked_images': data.get('clicked_images', False),
-            'viewed_reviews': data.get('viewed_reviews', False),
-            'read_percentage': data.get('read_percentage', 0.0)
-        }
-        
-        if engagement_type == 'product' and item_id:
-            # Update existing product view with engagement data
-            user_id = current_user.id if current_user.is_authenticated else get_user_id()
-            session_id = get_session_id()
-            
-            # Find the most recent product view for this user/session
-            product_view = ProductView.query.filter_by(
-                user_id=user_id,
-                product_id=item_id,
-                session_id=session_id
-            ).order_by(ProductView.viewed_at.desc()).first()
-            
-            if product_view:
-                product_view.view_duration = engagement_data['duration']
-                product_view.scroll_depth = engagement_data['scroll_depth']
-                product_view.clicked_images = engagement_data['clicked_images']
-                product_view.viewed_reviews = engagement_data['viewed_reviews']
-                db.session.commit()
-        
-        elif engagement_type == 'content' and item_id:
-            # Update existing content view with engagement data
-            user_id = current_user.id if current_user.is_authenticated else get_user_id()
-            session_id = get_session_id()
-            
-            # Find the most recent content view for this user/session
-            content_view = ContentView.query.filter_by(
-                user_id=user_id,
-                content_id=item_id,
-                session_id=session_id
-            ).order_by(ContentView.viewed_at.desc()).first()
-            
-            if content_view:
-                content_view.view_duration = engagement_data['duration']
-                content_view.scroll_depth = engagement_data['scroll_depth']
-                content_view.read_percentage = engagement_data['read_percentage']
-                db.session.commit()
-        
-        return jsonify({'success': True, 'message': 'Engagement tracked successfully'})
-    
-    except Exception as e:
-        app.logger.error(f"Error tracking engagement: {e}")
-        return jsonify({'error': 'Failed to track engagement'}), 500
-
-@app.route('/api/session-heartbeat', methods=['POST'])
-def session_heartbeat():
-    """API endpoint to update session activity"""
-    try:
-        session_id = get_session_id()
-        user_id = current_user.id if current_user.is_authenticated else get_user_id()
-        
-        # Update session last activity
-        user_session = UserSession.query.filter_by(session_id=session_id).first()
-        if user_session:
-            user_session.last_activity = datetime.utcnow()
-            db.session.commit()
-        
-        return jsonify({'success': True})
-    
-    except Exception as e:
-        app.logger.error(f"Error updating session heartbeat: {e}")
-        return jsonify({'error': 'Failed to update session'}), 500
-
-# Newsletter Routes
-
-@app.route('/newsletter/subscribe', methods=['GET', 'POST'])
-def newsletter_subscribe():
-    """Newsletter subscription form with fashion preferences"""
-    form = NewsletterSubscriptionForm()
-    
-    if form.validate_on_submit():
-        try:
-            # Check if email already exists
-            existing_subscription = NewsletterSubscription.query.filter_by(
-                email=form.email.data
-            ).first()
-            
-            if existing_subscription and existing_subscription.is_active:
-                flash(get_translation('newsletter_already_subscribed'), 'warning')
-                return redirect(url_for('newsletter_subscribe'))
-            
-            # Create new subscription
-            subscription = NewsletterSubscription()
-            subscription.email = form.email.data
-            subscription.first_name = form.first_name.data
-            subscription.preferred_categories = ','.join(form.preferred_categories.data)
-            subscription.style_preferences = ','.join(form.style_preferences.data)
-            subscription.size_range = form.size_range.data
-            subscription.budget_range = form.budget_range.data
-            subscription.color_preferences = ','.join(form.color_preferences.data) if form.color_preferences.data else None
-            subscription.frequency = form.frequency.data
-            subscription.user_id = current_user.id if current_user.is_authenticated else None
-            subscription.is_active = True
-            subscription.subscription_date = datetime.utcnow()
-            
-            db.session.add(subscription)
-            db.session.commit()
-            
-            # Send welcome email
-            try:
-                newsletter_service.send_welcome_email(subscription)
-                flash(get_translation('newsletter_subscribed_success'), 'success')
-            except Exception as e:
-                app.logger.error(f"Error sending welcome email: {e}")
-                flash(get_translation('newsletter_subscribed_no_email'), 'warning')
-            
-            return redirect(url_for('index'))
-            
-        except Exception as e:
-            app.logger.error(f"Error creating newsletter subscription: {e}")
-            flash(get_translation('error_occurred'), 'error')
-            db.session.rollback()
-    
-    return render_template('newsletter_subscribe.html', form=form)
-
-@app.route('/newsletter/unsubscribe/<token>')
-def newsletter_unsubscribe(token):
-    """Unsubscribe from newsletter using token"""
-    try:
-        subscription = NewsletterSubscription.query.filter_by(
-            unsubscribe_token=token
-        ).first()
-        
-        if not subscription:
-            flash(get_translation('invalid_unsubscribe_link'), 'error')
-            return redirect(url_for('index'))
-        
-        subscription.is_active = False
-        subscription.unsubscribed_at = datetime.utcnow()
-        db.session.commit()
-        
-        flash(get_translation('newsletter_unsubscribed'), 'success')
-        return redirect(url_for('index'))
-        
-    except Exception as e:
-        app.logger.error(f"Error unsubscribing from newsletter: {e}")
-        flash(get_translation('error_occurred'), 'error')
-        return redirect(url_for('index'))
-
-@app.route('/newsletter/preview/<int:newsletter_id>')
-@require_login
-def newsletter_preview(newsletter_id):
-    """Preview newsletter before sending (admin only)"""
-    try:
-        newsletter = FashionNewsletter.query.get_or_404(newsletter_id)
-        
-        # Generate preview data
-        preview_data = newsletter_service.generate_newsletter_preview(newsletter)
-        
-        return render_template('newsletter_preview.html', 
-                             newsletter=newsletter,
-                             preview_data=preview_data)
-        
-    except Exception as e:
-        app.logger.error(f"Error previewing newsletter: {e}")
-        flash(get_translation('error_occurred'), 'error')
-        return redirect(url_for('index'))
-
-@app.route('/newsletter/send/<int:newsletter_id>', methods=['POST'])
-@require_login
-def send_newsletter(newsletter_id):
-    """Send newsletter to all subscribers"""
-    try:
-        newsletter = FashionNewsletter.query.get_or_404(newsletter_id)
-        
-        if newsletter.sent_at:
-            flash('Newsletter has already been sent', 'warning')
-            return redirect(url_for('newsletter_preview', newsletter_id=newsletter_id))
-        
-        # Send newsletter using background task or immediate send
-        result = newsletter_service.send_newsletter(newsletter)
-        
-        if result['success']:
-            flash(f"Newsletter sent successfully to {result['sent_count']} subscribers", 'success')
-        else:
-            flash(f"Newsletter sending completed with {result['error_count']} errors", 'warning')
-        
-        return redirect(url_for('newsletter_analytics'))
-        
-    except Exception as e:
-        app.logger.error(f"Error sending newsletter: {e}")
-        flash(get_translation('error_occurred'), 'error')
-        return redirect(url_for('index'))
-
-@app.route('/newsletter/analytics')
-@require_login
-def newsletter_analytics():
-    """Newsletter analytics dashboard"""
-    try:
-        # Get newsletter statistics
-        total_subscribers = NewsletterSubscription.query.filter_by(is_active=True).count()
-        total_sent = FashionNewsletter.query.filter(FashionNewsletter.sent_at.isnot(None)).count()
-        
-        # Recent newsletters
-        recent_newsletters = FashionNewsletter.query.order_by(
-            FashionNewsletter.created_at.desc()
-        ).limit(10).all()
-        
-        # Subscription analytics
-        subscription_data = db.session.query(
-            func.date(NewsletterSubscription.subscription_date).label('date'),
-            func.count(NewsletterSubscription.id).label('count')
-        ).filter(
-            NewsletterSubscription.subscription_date >= datetime.utcnow() - timedelta(days=30)
-        ).group_by(
-            func.date(NewsletterSubscription.subscription_date)
-        ).order_by(
-            func.date(NewsletterSubscription.subscription_date)
-        ).all()
-        
-        # Category preferences
-        category_stats = {}
-        active_subscriptions = NewsletterSubscription.query.filter_by(is_active=True).all()
-        
-        for subscription in active_subscriptions:
-            if subscription.preferred_categories:
-                categories = subscription.preferred_categories.split(',')
-                for category in categories:
-                    category = category.strip()
-                    category_stats[category] = category_stats.get(category, 0) + 1
-        
-        # Newsletter performance
-        newsletter_analytics = NewsletterAnalytics.query.join(
-            FashionNewsletter
-        ).order_by(FashionNewsletter.sent_at.desc()).limit(5).all()
-        
-        return render_template('newsletter_analytics.html',
-                             total_subscribers=total_subscribers,
-                             total_sent=total_sent,
-                             recent_newsletters=recent_newsletters,
-                             subscription_data=subscription_data,
-                             category_stats=category_stats,
-                             newsletter_analytics=newsletter_analytics)
-        
-    except Exception as e:
-        app.logger.error(f"Error in newsletter analytics: {e}")
-        flash(get_translation('error_occurred'), 'error')
-        return redirect(url_for('index'))
-
-@app.route('/newsletter/create', methods=['GET', 'POST'])
-@require_login
-def create_newsletter():
-    """Create a new fashion newsletter"""
-    if request.method == 'POST':
-        try:
-            # Get form data
-            subject = request.form.get('subject')
-            template_type = request.form.get('template_type', 'weekly_inspiration')
-            
-            if not subject:
-                flash('Newsletter subject is required', 'error')
-                return redirect(url_for('create_newsletter'))
-            
-            # Create newsletter
-            newsletter = FashionNewsletter()
-            newsletter.subject = subject
-            newsletter.template_type = template_type
-            newsletter.created_by = current_user.id
-            newsletter.created_at = datetime.utcnow()
-            
-            # Generate content based on template type
-            newsletter.content = newsletter_service.generate_newsletter_content(template_type)
-            
-            db.session.add(newsletter)
-            db.session.commit()
-            
-            flash('Newsletter created successfully', 'success')
-            return redirect(url_for('newsletter_preview', newsletter_id=newsletter.id))
-            
-        except Exception as e:
-            app.logger.error(f"Error creating newsletter: {e}")
-            flash(get_translation('error_occurred'), 'error')
-            db.session.rollback()
-    
-    return render_template('create_newsletter.html')
-
-@app.route('/api/story/<int:story_id>/like', methods=['POST'])
-@csrf.exempt
-def api_story_like(story_id):
-    """API endpoint to like a story"""
-    try:
-        story = Story.query.get_or_404(story_id)
-        story.increment_likes()
-        
-        # Track user interaction for recommendation algorithm
-        if current_user.is_authenticated:
-            track_story_interaction(current_user.id, story_id, 'like')
-        
-        return jsonify({
-            'success': True,
-            'likes': story.like_count,
-            'message': 'Story liked successfully'
-        })
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'message': f'Error liking story: {str(e)}'
-        }), 500
-
-@app.route('/api/story/<int:story_id>/view', methods=['POST'])
-@csrf.exempt
-def api_story_view(story_id):
-    """API endpoint to track story view"""
-    try:
-        story = Story.query.get_or_404(story_id)
-        story.increment_views()
-        
-        # Track user interaction for recommendation algorithm
-        if current_user.is_authenticated:
-            track_story_interaction(current_user.id, story_id, 'view')
-        
-        return jsonify({
-            'success': True,
-            'views': story.view_count,
-            'message': 'Story view tracked'
-        })
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'message': f'Error tracking view: {str(e)}'
-        }), 500
-
-@app.route('/api/stories/next/<int:current_story_id>')
-def api_get_next_stories(current_story_id):
-    """Get next recommended stories based on current story"""
-    try:
-        # Get current story
-        current_story = Story.query.get_or_404(current_story_id)
-        
-        # Get all active stories except current one
-        all_stories = Story.get_active_stories(limit=50)
-        remaining_stories = [s for s in all_stories if s.id != current_story_id]
-        
-        # Apply recommendation algorithm
-        if current_user.is_authenticated:
-            recommended_stories = get_personalized_story_recommendations(current_user.id, remaining_stories)
-        else:
-            recommended_stories = get_trending_story_recommendations(remaining_stories)
-        
-        # Return top 10 recommended stories
-        next_stories = recommended_stories[:10]
-        
-        stories_data = []
-        for story in next_stories:
-            stories_data.append({
-                'id': story.id,
-                'title': story.get_localized_title(session.get('language', 'en')),
-                'content': story.get_localized_content(session.get('language', 'en')),
-                'image_url': story.image_url,
-                'story_type': story.story_type,
-                'author_name': story.author_name,
-                'view_count': story.view_count,
-                'like_count': story.like_count,
-                'click_count': story.click_count,
-                'time_remaining': story.time_remaining_korean(),
-                'is_expired': story.is_expired(),
-                'linked_product_id': story.linked_product_id,
-                'background_color': story.background_color or '#007bff'
-            })
-        
-        return jsonify({
-            'success': True,
-            'stories': stories_data
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'message': f'Error getting recommendations: {str(e)}'
-        }), 500
-
-def track_story_interaction(user_id, story_id, interaction_type):
-    """Track story interactions for recommendation algorithm"""
-    try:
-        # Create a story interaction record for learning
-        # This data will be used to improve future recommendations
-        
-        # For now, we'll log the interaction and potentially store in user interaction table
-        print(f"Story interaction tracked: User {user_id}, Story {story_id}, Type {interaction_type}")
-        
-        # In future iterations, could create dedicated StoryInteraction table:
-        # story_interaction = StoryInteraction()
-        # story_interaction.user_id = user_id
-        # story_interaction.story_id = story_id
-        # story_interaction.interaction_type = interaction_type
-        # story_interaction.created_at = datetime.now()
-        # db.session.add(story_interaction)
-        # db.session.commit()
-        
-    except Exception as e:
-        print(f"Error tracking story interaction: {e}")
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

@@ -1,7 +1,7 @@
 from flask_wtf import FlaskForm
 from flask_wtf.file import FileField, FileAllowed
-from wtforms import StringField, TextAreaField, SelectField, SubmitField, DecimalField, IntegerField, BooleanField, DateTimeField, SelectMultipleField, EmailField
-from wtforms.validators import DataRequired, Length, NumberRange, Optional, Email
+from wtforms import StringField, TextAreaField, SelectField, SubmitField, DecimalField, IntegerField, BooleanField, DateTimeField
+from wtforms.validators import DataRequired, Length, NumberRange, Optional
 
 class ContentForm(FlaskForm):
     """Form for creating new content"""
@@ -214,7 +214,7 @@ class StoryForm(FlaskForm):
     
     expires_at = DateTimeField('Expires At', validators=[
         DataRequired(message='Expiration time is required')
-    ], description='When this story should expire (YYYY-MM-DD HH:MM)', format='%Y-%m-%dT%H:%M')
+    ], description='When this story should expire (YYYY-MM-DD HH:MM)')
     
     priority = IntegerField('Priority', validators=[
         NumberRange(min=1, max=10, message='Priority must be between 1 and 10')
@@ -229,91 +229,3 @@ class StoryForm(FlaskForm):
                            description='Link to a product if this is a product story')
     
     submit = SubmitField('Create Story')
-
-class NewsletterSubscriptionForm(FlaskForm):
-    """Form for newsletter subscription with fashion preferences"""
-    email = EmailField('Email Address', validators=[
-        DataRequired(message='Email is required'),
-        Email(message='Please enter a valid email address')
-    ])
-    
-    first_name = StringField('First Name', validators=[
-        Optional(),
-        Length(max=100, message='First name must be less than 100 characters')
-    ])
-    
-    preferred_categories = SelectMultipleField('Fashion Categories', 
-        choices=[
-            ('Clothing', 'Clothing'),
-            ('Accessories', 'Accessories'),
-            ('Shoes', 'Shoes'),
-            ('Bags', 'Bags'),
-            ('Jewelry', 'Jewelry')
-        ],
-        validators=[DataRequired(message='Please select at least one category')]
-    )
-    
-    style_preferences = SelectMultipleField('Style Preferences',
-        choices=[
-            ('casual', 'Casual'),
-            ('formal', 'Formal'),
-            ('trendy', 'Trendy'),
-            ('vintage', 'Vintage'),
-            ('minimalist', 'Minimalist'),
-            ('bohemian', 'Bohemian'),
-            ('sporty', 'Sporty')
-        ],
-        validators=[DataRequired(message='Please select at least one style preference')]
-    )
-    
-    size_range = SelectField('Size Range', 
-        choices=[
-            ('XS', 'Extra Small (XS)'),
-            ('S', 'Small (S)'),
-            ('M', 'Medium (M)'),
-            ('L', 'Large (L)'),
-            ('XL', 'Extra Large (XL)'),
-            ('XXL', '2XL'),
-            ('varied', 'Varied/Multiple Sizes')
-        ],
-        validators=[Optional()]
-    )
-    
-    budget_range = SelectField('Budget Range',
-        choices=[
-            ('budget', 'Budget-Friendly (Under $50)'),
-            ('mid-range', 'Mid-Range ($50-$200)'),
-            ('luxury', 'Luxury ($200+)'),
-            ('varied', 'Varied Budget')
-        ],
-        validators=[Optional()]
-    )
-    
-    color_preferences = SelectMultipleField('Favorite Colors',
-        choices=[
-            ('black', 'Black'),
-            ('white', 'White'),
-            ('gray', 'Gray'),
-            ('navy', 'Navy'),
-            ('blue', 'Blue'),
-            ('red', 'Red'),
-            ('pink', 'Pink'),
-            ('green', 'Green'),
-            ('yellow', 'Yellow'),
-            ('brown', 'Brown'),
-            ('beige', 'Beige'),
-            ('purple', 'Purple')
-        ],
-        validators=[Optional()]
-    )
-    
-    frequency = SelectField('Email Frequency',
-        choices=[
-            ('weekly', 'Weekly'),
-            ('monthly', 'Monthly')
-        ],
-        validators=[DataRequired()],
-        default='weekly'
-    )
-    
-    submit = SubmitField('Subscribe to Fashion Newsletter')
